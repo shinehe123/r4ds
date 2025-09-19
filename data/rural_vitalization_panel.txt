@@ -1,0 +1,27 @@
+# Rural Vitalization Panel (Synthetic)
+
+This dataset provides a synthetic province-level panel (2013–2023) that can be
+used to prototype empirical analyses on how agricultural lending affects rural
+vitalization outcomes. The accompanying Python script `data-raw/rural_vitalization_panel.py`
+generates the data deterministically so the file can be recreated at any time.
+
+## Structure
+
+- **Observations**: 341 (31 provinces × 11 years).
+- **Time span**: 2013–2023 with a policy dummy `post_rural_vitalization` that
+  switches to 1 starting in 2018.
+- **Key credit variables**:
+  - `agri_loan_balance` (billion yuan) and its within-province growth rate
+    `agri_loan_growth_rate`.
+- **Thirteen secondary indicators** aligned with the five dimensions of the
+  rural vitalization evaluation system (industry, ecology, culture, governance,
+  affluence). Negative indicators—`fertilizer_use_intensity` and
+  `rural_engel_coefficient`—are treated accordingly when computing scores.
+- **Composite indices**: first-level scores (`industry_score`, `ecology_score`,
+  `culture_score`, `governance_score`, `affluence_score`) and the overall
+  `rural_vitalization_index`, all rescaled to a 0–100 range using the weights
+  described in the analysis (primary dimension weights 0.25/0.20/0.15/0.20/0.20).
+
+Because the values are simulated, they should be interpreted as placeholders for
+sensitivity checks, code prototyping, or teaching materials rather than as real
+statistics.
