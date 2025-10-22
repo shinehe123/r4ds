@@ -11,10 +11,13 @@
 - 文字分析报告；
 - 时间演化折线图以及某一年核心城市网络可视化图。
 
-脚本默认分析 2020 年作为示例年份，可通过修改 ``TARGET_YEAR`` 调整。
+默认情况下脚本会在脚本所在目录查找上述两个 Excel 文件，分析 2020 年数据，
+并将所有输出写入 ``outputs/`` 目录。可以通过命令行参数自定义这些路径与
+年份。
 """
 from __future__ import annotations
 
+import argparse
 import warnings
 from collections import defaultdict
 from pathlib import Path
@@ -32,12 +35,11 @@ warnings.filterwarnings("ignore")
 plt.rcParams["font.sans-serif"] = ["SimHei", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
 
-CITATION_FILE = "专利引用数据.xlsx"
-COMPANY_FILE = "上市公司基本信息库(2022年更新).xlsx"
-OUTPUT_DIR = Path("outputs")
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-TARGET_YEAR = 2020
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_CITATION_FILE = BASE_DIR / "专利引用数据.xlsx"
+DEFAULT_COMPANY_FILE = BASE_DIR / "上市公司基本信息库(2022年更新).xlsx"
+DEFAULT_OUTPUT_DIR = BASE_DIR / "outputs"
+DEFAULT_TARGET_YEAR = 2020
 
 # ==================== 工具函数 ====================
 
@@ -228,14 +230,26 @@ class CompanyIndex:
 
 # ==================== 数据加载与清洗 ====================
 
-def load_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
+def load_data(
+    citation_path: Path, company_path: Path
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     print("=" * 80)
     print("地级市创新合作网络构建系统".center(70))
     print("=" * 80)
 
     print("\n📂 Step 1: 加载数据...")
-    citation_df = pd.read_excel(CITATION_FILE)
-    company_df = pd.read_excel(COMPANY_FILE)
+
+    if not citation_path.exists():
+        raise FileNotFoundError(
+            f"未找到专利引用数据文件: {citation_path}. 请使用 --citation-file 指定正确路径。"
+        )
+    if not company_path.exists():
+        raise FileNotFoundError(
+            f"未找到上市公司信息文件: {company_path}. 请使用 --company-file 指定正确路径。"
+        )
+
+    citation_df = pd.read_excel(citation_path)
+    company_df = pd.read_excel(company_path)
     print(f"   ✅ 专利引用数据加载成功: {len(citation_df)} 条记录")
     print(f"   ✅ 上市公司数据加载成功: {len(company_df)} 家公司")
 
@@ -496,7 +510,7 @@ def compute_time_evolution(edges_df: pd.DataFrame) -> pd.DataFrame:
     return evolution_df
 
 
-def plot_time_evolution(evolution_df: pd.DataFrame) -> None:
+def plot_time_evolution(evolution_df: pd.DataFrame, output_dir: Path) -> None:
     if evolution_df.empty:
         return
 
@@ -582,13 +596,13 @@ def plot_time_evolution(evolution_df: pd.DataFrame) -> None:
     axes[1, 2].grid(True, alpha=0.3, axis="y")
 
     plt.tight_layout()
-    output_path = OUTPUT_DIR / "地级市创新合作网络_时间演化.png"
+    output_path = output_dir / "地级市创新合作网络_时间演化.png"
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     print(f"\n   ✅ 演化趋势图已保存: {output_path}")
     plt.close(fig)
 
 
-def visualize_city_network(G: nx.DiGraph, year: int) -> None:
+def visualize_city_network(G: nx.DiGraph, year: int, output_dir: Path) -> None:
     if G is None or G.number_of_nodes() == 0:
         return
 
@@ -646,7 +660,7 @@ def visualize_city_network(G: nx.DiGraph, year: int) -> None:
     plt.axis("off")
     plt.tight_layout()
 
-    output_path = OUTPUT_DIR / f"地级市创新合作网络可视化_{year}.png"
+    output_path = output_dir / f"地级市创新合作网络可视化_{year}.png"
     plt.savefig(output_path, dpi=300, bbox_inches="tight", facecolor="white")
     print(f"   ✅ 网络可视化图已保存: {output_path}")
     plt.close()
@@ -736,20 +750,21 @@ def save_outputs(
     top_in: list,
     top_out: list,
     top_bridges: list,
+    output_dir: Path,
 ) -> None:
-    edges_output = OUTPUT_DIR / "地级市创新合作网络_边表.csv"
+    edges_output = output_dir / "地级市创新合作网络_边表.csv"
     city_network.to_csv(edges_output, index=False, encoding="utf-8-sig")
     print(f"   ✅ 城市层面边表已保存: {edges_output}")
 
-    nodes_output = OUTPUT_DIR / "地级市创新合作网络_节点表.csv"
+    nodes_output = output_dir / "地级市创新合作网络_节点表.csv"
     nodes_table.to_csv(nodes_output, index=False, encoding="utf-8-sig")
     print(f"   ✅ 城市层面节点表已保存: {nodes_output}")
 
-    evolution_output = OUTPUT_DIR / "地级市创新合作网络_时间演化.csv"
+    evolution_output = output_dir / "地级市创新合作网络_时间演化.csv"
     evolution_df.to_csv(evolution_output, index=False, encoding="utf-8-sig")
     print(f"   ✅ 时间演化数据已保存: {evolution_output}")
 
-    report_output = OUTPUT_DIR / "地级市创新合作网络_分析报告.txt"
+    report_output = output_dir / "地级市创新合作网络_分析报告.txt"
     with report_output.open("w", encoding="utf-8") as f:
         f.write("=" * 80 + "\n")
         f.write("地级市创新合作网络分析报告\n")
@@ -792,8 +807,15 @@ def save_outputs(
 
 # ==================== 主流程 ====================
 
-def main() -> None:
-    citation_df, company_df = load_data()
+def run_workflow(
+    citation_path: Path,
+    company_path: Path,
+    output_dir: Path,
+    target_year: int,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    citation_df, company_df = load_data(citation_path, company_path)
     citation_df = clean_citation_data(citation_df)
     company_index = CompanyIndex(company_df)
     citation_df = match_citing_company_codes(citation_df, company_index)
@@ -802,7 +824,7 @@ def main() -> None:
     print("\n" + "=" * 80)
     print("📊 Step 5: 地级市网络深度分析...")
 
-    stats, top_in, top_out, G_year = analyze_city_network(city_network, TARGET_YEAR)
+    stats, top_in, top_out, G_year = analyze_city_network(city_network, target_year)
     if stats:
         print(f"\n   📈 {stats['年份']} 年网络统计指标:")
         for key, value in stats.items():
@@ -843,12 +865,12 @@ def main() -> None:
                 print(f"         ... 还有 {len(members) - 5} 座城市")
 
     evolution_df = compute_time_evolution(city_network)
-    plot_time_evolution(evolution_df)
+    plot_time_evolution(evolution_df, output_dir)
 
     if G_year and G_year.number_of_nodes() > 0:
         print("\n" + "=" * 80)
         print("🎨 Step 8: 网络可视化...")
-        visualize_city_network(G_year, TARGET_YEAR)
+        visualize_city_network(G_year, target_year, output_dir)
 
     overall_edges = (
         city_network.groupby(["source_city", "target_city"], as_index=False)
@@ -866,20 +888,65 @@ def main() -> None:
 
     print("\n" + "=" * 80)
     print("💾 Step 10: 保存分析结果...")
-    save_outputs(city_network, nodes_table, evolution_df, stats, top_in, top_out, top_bridges)
+    save_outputs(
+        city_network,
+        nodes_table,
+        evolution_df,
+        stats,
+        top_in,
+        top_out,
+        top_bridges,
+        output_dir,
+    )
 
     print("\n" + "=" * 80)
     print("✅ 地级市创新合作网络构建与分析完成！".center(70))
     print("=" * 80)
 
-    print("\n📁 生成的文件 (位于 outputs/):")
+    print(f"\n📁 生成的文件 (位于 {output_dir.resolve()}):")
     print("   1. 地级市创新合作网络_边表.csv")
     print("   2. 地级市创新合作网络_节点表.csv")
     print("   3. 地级市创新合作网络_时间演化.csv")
     print("   4. 地级市创新合作网络_分析报告.txt")
     print("   5. 地级市创新合作网络_时间演化.png")
     if G_year and G_year.number_of_nodes() > 0:
-        print(f"   6. 地级市创新合作网络可视化_{TARGET_YEAR}.png")
+        print(f"   6. 地级市创新合作网络可视化_{target_year}.png")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="构建基于上市公司专利引用的地级市创新合作网络"
+    )
+    parser.add_argument(
+        "--citation-file",
+        type=Path,
+        default=DEFAULT_CITATION_FILE,
+        help="专利引用数据 Excel 文件路径 (默认: 脚本同目录)",
+    )
+    parser.add_argument(
+        "--company-file",
+        type=Path,
+        default=DEFAULT_COMPANY_FILE,
+        help="上市公司基本信息 Excel 文件路径 (默认: 脚本同目录)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help="输出结果目录 (默认: 脚本同目录的 outputs/)",
+    )
+    parser.add_argument(
+        "--target-year",
+        type=int,
+        default=DEFAULT_TARGET_YEAR,
+        help="进行详细分析与可视化的年份 (默认: 2020)",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    run_workflow(args.citation_file, args.company_file, args.output_dir, args.target_year)
 
 
 if __name__ == "__main__":
