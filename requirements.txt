@@ -1,0 +1,4 @@
+networkx>=3.2,<4
+pandas>=2.0,<4
+openpyxl>=3.1,<4
+cpca==0.5.5

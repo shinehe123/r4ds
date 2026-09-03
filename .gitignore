@@ -13,3 +13,6 @@ _main.*
 bookdown*
 tmp-pdfcrop-*
 figures
+__pycache__/
+*.py[cod]
+outputs/

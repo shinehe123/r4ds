@@ -1,952 +1,718 @@
 #!/usr/bin/env python3
-"""构建基于上市公司专利引用的地级市创新合作网络的脚本。
+"""Map listed companies to Chinese prefectures and aggregate innovation links.
 
-该脚本使用两份 Excel 数据：
-1. ``专利引用数据.xlsx``: 记录上市公司层面的专利引用信息；
-2. ``上市公司基本信息库(2022年更新).xlsx``: 记录上市公司基本信息（包括省份、地级市等）。
+``map-companies`` parses registered/office addresses into an auditable
+company--city crosswalk. ``build-network`` joins a company-level patent
+collaboration/citation edge list to that crosswalk and aggregates annual
+inter-city networks.
 
-输出包括：
-- 城市层面的引用边表、节点表；
-- 各年份网络演化指标；
-- 文字分析报告；
-- 时间演化折线图以及某一年核心城市网络可视化图。
-
-默认情况下脚本会在脚本所在目录查找上述两个 Excel 文件，分析 2020 年数据，
-并将所有输出写入 ``outputs/`` 目录。可以通过命令行参数自定义这些路径与
-年份。
+Repaco group-member records are not interpreted as innovation links. They are
+useful as an exclusion list but contain neither patent identifiers nor member
+locations and event years.
 """
 from __future__ import annotations
 
 import argparse
-import warnings
-from collections import defaultdict
-from pathlib import Path
+import importlib.metadata
 import re
-from typing import Dict, Iterable, Optional, Tuple
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Optional
 
-import matplotlib.pyplot as plt
 import networkx as nx
-import numpy as np
 import pandas as pd
 
-warnings.filterwarnings("ignore")
 
-# ==================== 全局配置 ====================
-plt.rcParams["font.sans-serif"] = ["SimHei", "DejaVu Sans"]
-plt.rcParams["axes.unicode_minus"] = False
-
-BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_CITATION_FILE = BASE_DIR / "专利引用数据.xlsx"
-DEFAULT_COMPANY_FILE = BASE_DIR / "上市公司基本信息库(2022年更新).xlsx"
-DEFAULT_OUTPUT_DIR = BASE_DIR / "outputs"
-DEFAULT_TARGET_YEAR = 2020
-
-# ==================== 工具函数 ====================
-
-def normalize_code(code: object) -> Optional[str]:
-    """标准化证券代码，补齐位数并移除无效字符。"""
-    if pd.isna(code):
-        return None
-    code_str = str(code).strip()
-    if not code_str:
-        return None
-    if code_str.lower() in {"nan", "none", "null"}:
-        return None
-    # 去掉 Excel 导致的 ".0"
-    code_str = re.sub(r"\.0+$", "", code_str)
-    if code_str.isdigit():
-        return code_str.zfill(6)
-    return code_str
-
-
-def clean_company_name(name: str) -> str:
-    """移除常见后缀的公司名称，用于模糊匹配。"""
-    if not name:
-        return ""
-    name = str(name).strip()
-    patterns = (
-        "股份有限公司",
-        "有限责任公司",
-        "有限公司",
-        "集团股份有限公司",
-        "集团有限公司",
-        "集团股份",
-        "股份公司",
-        "公司",
-    )
-    for pattern in patterns:
-        if name.endswith(pattern):
-            name = name[: -len(pattern)]
-            break
-    return name.strip()
+CODE_ALIASES = ("code", "股票代码", "证券代码", "stock_code")
+NAME_ALIASES = ("name", "公司名称", "公司中文名称", "企业名称")
+SHORT_NAME_ALIASES = ("aliases", "证券简称", "证券名称", "简称")
+ADDRESS_ALIASES = ("address", "注册地址", "办公地址", "公司地址")
+SOURCE_CODE_ALIASES = (
+    "source_code", "applicant_code", "citing_code", "引用方代码", "申请人代码",
+)
+TARGET_CODE_ALIASES = (
+    "target_code", "partner_code", "cited_code", "被引用方代码", "合作方代码",
+)
+SOURCE_NAME_ALIASES = (
+    "source_name", "applicant_name", "citing_name", "引用方", "申请人",
+)
+TARGET_NAME_ALIASES = (
+    "target_name", "partner_name", "cited_name", "被引用方", "合作方",
+)
+YEAR_ALIASES = ("year", "申请年", "申请年份", "被引用年度", "年份")
+WEIGHT_ALIASES = (
+    "weight", "count", "citation_count", "被引用次数", "合作专利数", "专利数",
+)
+PATENT_ALIASES = ("patent_id", "申请号", "专利申请号", "publication_number")
+SOURCE_ADDRESS_ALIASES = ("source_address", "listed_address", "上市公司地址", "申请人地址")
+TARGET_ADDRESS_ALIASES = ("target_address", "partner_address", "合作方地址", "共同申请人地址")
+DATE_ALIASES = ("application_date", "申请日", "申请日期")
+MUNICIPALITIES = {"北京市", "天津市", "上海市", "重庆市"}
+SUFFIXES = (
+    "特别行政区", "维吾尔自治区", "壮族自治区", "回族自治区", "自治区",
+    "自治州", "地区", "盟", "省", "市",
+)
+COUNTY_SUFFIXES = ("自治县", "自治旗", "新区", "矿区", "林区", "特区", "县", "市", "区", "旗")
 
 
-def first_existing_column(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
-    """从候选列中返回第一个存在的列名。"""
-    for col in candidates:
-        if col in df.columns:
-            return col
+def read_table(path: Path) -> pd.DataFrame:
+    """Read CSV/Excel while preserving leading zeros in security codes."""
+    if path.suffix.lower() in {".xlsx", ".xls"}:
+        return pd.read_excel(path, dtype=str)
+    if path.suffix.lower() in {".csv", ".txt"}:
+        return pd.read_csv(path, dtype=str, low_memory=False)
+    raise ValueError(f"Unsupported file type: {path.suffix}")
+
+
+def choose_column(
+    frame: pd.DataFrame,
+    explicit: Optional[str],
+    aliases: Iterable[str],
+    label: str,
+    required: bool = True,
+) -> Optional[str]:
+    if explicit:
+        if explicit not in frame.columns:
+            raise ValueError(f"Column '{explicit}' supplied for {label} was not found")
+        return explicit
+    for candidate in aliases:
+        if candidate in frame.columns:
+            return candidate
+    if required:
+        raise ValueError(f"Could not identify {label}; available columns: {list(frame.columns)}")
     return None
 
 
-def format_city(province: Optional[str], city: Optional[str]) -> Optional[str]:
-    """组合省份与地级市，生成唯一的地级市标识。"""
-    if pd.isna(province):
-        province = ""
-    if pd.isna(city):
-        city = ""
-    province = str(province).strip()
-    city = str(city).strip()
-    if not province and not city:
+def normalize_code(value: object) -> Optional[str]:
+    if pd.isna(value):
         return None
-    if province and city:
-        return f"{province}·{city}"
-    return city or province
+    text = re.sub(r"\.0+$", "", str(value).strip())
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return None
+    return text.zfill(6) if text.isdigit() and len(text) <= 6 else text
 
 
-class CompanyIndex:
-    """上市公司信息索引，便于通过公司名称或代码检索信息。"""
+def normalize_name(value: object) -> Optional[str]:
+    if pd.isna(value):
+        return None
+    text = re.sub(r"[\s（）()·•]", "", str(value)).upper()
+    text = re.sub(
+        r"(?:集团股份有限公司|股份有限公司|有限责任公司|集团有限公司|有限公司|股份公司|公司)$",
+        "",
+        text,
+    )
+    return text or None
 
-    def __init__(self, df: pd.DataFrame) -> None:
-        if "股票代码" not in df.columns:
-            raise ValueError("上市公司基本信息数据缺少'股票代码'列")
 
-        df = df.copy()
-        df["股票代码"] = df["股票代码"].map(normalize_code)
-        self.df = df
+def strip_admin_suffix(name: str) -> str:
+    for suffix in SUFFIXES:
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
 
-        name_columns = [
-            col
-            for col in ["公司中文名称", "证券简称", "证券名称", "公司名称", "简称"]
-            if col in df.columns
-        ]
 
-        exact_map: Dict[str, set[str]] = defaultdict(set)
-        clean_map: Dict[str, set[str]] = defaultdict(set)
+def strip_county_suffix(name: str) -> str:
+    for suffix in COUNTY_SUFFIXES:
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
 
-        for _, row in df.iterrows():
-            code = row["股票代码"]
-            if not code:
-                continue
-            for col in name_columns:
-                raw_name = row[col]
-                if pd.isna(raw_name):
-                    continue
-                raw_name_str = str(raw_name).strip()
-                if not raw_name_str:
-                    continue
-                exact_map[raw_name_str].add(code)
-                cleaned = clean_company_name(raw_name_str)
-                if cleaned:
-                    clean_map[cleaned].add(code)
 
-        self.exact_map = {k: list(v) for k, v in exact_map.items()}
-        self.clean_map = {k: list(v) for k, v in clean_map.items()}
+def default_adcodes_path() -> Path:
+    """Locate cpca's adcode table without importing its legacy package API."""
+    try:
+        dist = importlib.metadata.distribution("cpca")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise RuntimeError(
+            "Administrative divisions unavailable. Run: pip install -r requirements.txt"
+        ) from exc
+    path = Path(dist.locate_file("cpca/resources/adcodes.csv"))
+    if not path.exists():
+        raise RuntimeError(f"Administrative-code table not found: {path}")
+    return path
 
-        self.province_col = first_existing_column(df, ["省份", "所属省份", "省"])
-        self.city_col = first_existing_column(
-            df,
-            [
-                "地级市",
-                "地级行政区划",
-                "城市",
-                "地市",
-                "地级市(2022年)",
-                "地级市名称",
-            ],
-        )
 
-        location_cols = ["股票代码"]
-        if self.province_col:
-            location_cols.append(self.province_col)
-        if self.city_col:
-            location_cols.append(self.city_col)
+@dataclass(frozen=True)
+class AdminUnit:
+    adcode: str
+    name: str
+    rank: int
+    province_code: str
+    city_code: Optional[str]
 
-        self.location_df = df[location_cols].drop_duplicates()
-        if self.province_col or self.city_col:
-            self.location_df["city_id"] = self.location_df.apply(
-                lambda row: format_city(
-                    row.get(self.province_col, "") if self.province_col else "",
-                    row.get(self.city_col, "") if self.city_col else "",
-                ),
-                axis=1,
+
+class AddressMapper:
+    """Deterministic address-to-prefecture mapper backed by PRC adcodes."""
+
+    def __init__(self, adcodes_path: Path) -> None:
+        raw = pd.read_csv(adcodes_path, dtype=str)
+        if not {"adcode", "name"}.issubset(raw.columns):
+            raise ValueError("adcodes file must contain adcode and name columns")
+        self.units: list[AdminUnit] = []
+        self.by_code: dict[str, AdminUnit] = {}
+        for row in raw[["adcode", "name"]].dropna().itertuples(index=False):
+            code = str(row.adcode)[:6]
+            rank = 0 if code.endswith("0000") else 1 if code.endswith("00") else 2
+            unit = AdminUnit(
+                code, str(row.name), rank, code[:2] + "0000",
+                (code[:4] + "00") if rank >= 1 else None,
             )
+            self.units.append(unit)
+            self.by_code[code] = unit
+        self.provinces = [u for u in self.units if u.rank == 0]
+        # ``市辖区``/``县`` are placeholder second-level names used beneath
+        # municipalities. Matching those literal words in a street address
+        # would create false city assignments.
+        self.cities = [
+            u for u in self.units if u.rank == 1 and u.name not in {"市辖区", "县"}
+        ]
+        self.counties = [u for u in self.units if u.rank == 2]
+
+    @staticmethod
+    def _matches(text: str, unit: AdminUnit, allow_short: bool) -> bool:
+        if unit.name in text:
+            return True
+        short = strip_admin_suffix(unit.name)
+        return allow_short and len(short) >= 2 and short in text
+
+    @staticmethod
+    def _position(text: str, unit: AdminUnit) -> int:
+        positions = [
+            p for p in (text.find(unit.name), text.find(strip_admin_suffix(unit.name))) if p >= 0
+        ]
+        return min(positions) if positions else 10**9
+
+    def _province(self, text: str) -> Optional[AdminUnit]:
+        # A full province name is strong evidence anywhere in the address.
+        # A stripped alias (e.g. ``山东``) is only safe near the beginning;
+        # otherwise street/community names such as ``松坪山东物`` create
+        # spurious province hints that suppress an explicit city match.
+        full_hits = [u for u in self.provinces if u.name in text]
+        if full_hits:
+            return min(full_hits, key=lambda u: text.find(u.name))
+        short_hits = [
+            u for u in self.provinces
+            if 0 <= text.find(strip_admin_suffix(u.name)) <= 8
+        ]
+        return min(short_hits, key=lambda u: self._position(text, u)) if short_hits else None
+
+    def map_one(self, address: object) -> dict[str, object]:
+        if pd.isna(address) or not str(address).strip():
+            return self._empty("missing_address")
+        text = re.sub(r"\s+", "", str(address))
+        province_hint = self._province(text)
+        city_hits = [u for u in self.cities if self._matches(text, u, True)]
+        # An explicit/leading city is stronger than a stripped province word
+        # embedded in a road name (e.g. 福州市...儒江西路 or 北海市西藏路).
+        if province_hint and province_hint.name not in text:
+            strong_city_hits = [
+                u for u in city_hits
+                if u.name in text or self._position(text, u) == 0
+            ]
+            if strong_city_hits and not any(
+                u.province_code == province_hint.adcode for u in strong_city_hits
+            ):
+                province_hint = None
+        if province_hint:
+            city_hits = [u for u in city_hits if u.province_code == province_hint.adcode]
+            province_short = strip_admin_suffix(province_hint.name)
+            city_hits = [
+                u for u in city_hits
+                if u.name in text
+                or strip_admin_suffix(u.name) != province_short
+                or text.find(province_short, len(province_hint.name)) >= 0
+            ]
+        county_hits = [u for u in self.counties if self._matches(text, u, False)]
+        if province_hint:
+            county_hits = [u for u in county_hits if u.province_code == province_hint.adcode]
+        county_alias_match = False
+        if not county_hits:
+            # Industrial-zone addresses frequently omit 县/区/市 from a
+            # county-level name (``江苏省丹阳经济开发区``). A province hint, or
+            # a unique county alias at position zero, makes that inference
+            # sufficiently constrained while remaining auditable as medium
+            # confidence.
+            alias_hits = [
+                u for u in self.counties
+                if len(strip_county_suffix(u.name)) >= 2
+                and strip_county_suffix(u.name) in text
+            ]
+            if province_hint:
+                alias_hits = [u for u in alias_hits if u.province_code == province_hint.adcode]
+            else:
+                alias_hits = [
+                    u for u in alias_hits if text.startswith(strip_county_suffix(u.name))
+                ]
+            if len({u.city_code for u in alias_hits}) == 1:
+                county_hits = alias_hits
+                county_alias_match = bool(alias_hits)
+
+        city: Optional[AdminUnit] = None
+        county: Optional[AdminUnit] = None
+        method, confidence = "unresolved", "unresolved"
+        if city_hits:
+            # Prefer an explicit full administrative name (``深圳市``) over a
+            # shorter alias that happens to occur earlier in the address.
+            city = min(city_hits, key=lambda u: (0 if u.name in text else 1, self._position(text, u)))
+            compatible_counties = [u for u in county_hits if u.city_code == city.adcode]
+            if compatible_counties:
+                county = min(compatible_counties, key=lambda u: self._position(text, u))
+            explicit = city.name in text
+            method, confidence = ("explicit_city", "high") if explicit else ("city_alias", "medium")
+        elif county_hits:
+            parent_codes = {u.city_code for u in county_hits}
+            if len(parent_codes) == 1:
+                county = min(county_hits, key=lambda u: self._position(text, u))
+                city = self.by_code.get(county.city_code or "")
+                method = "county_alias_inference" if county_alias_match else "county_inference"
+                confidence = "medium" if county_alias_match else ("high" if province_hint else "medium")
+        elif province_hint and province_hint.name in MUNICIPALITIES:
+            method, confidence = "municipality", "high"
+
+        province = province_hint
+        if city and not province:
+            province = self.by_code.get(city.province_code)
+        if county and not province:
+            province = self.by_code.get(county.province_code)
+        if province and province.name in MUNICIPALITIES:
+            city_name, city_code = province.name, province.adcode
+        elif city:
+            city_name, city_code = city.name, city.adcode
         else:
-            self.location_df["city_id"] = np.nan
+            city_name, city_code = None, None
+        return {
+            "province": province.name if province else None,
+            "province_code": province.adcode if province else None,
+            "city": city_name, "city_code": city_code,
+            "county": county.name if county else None,
+            "county_code": county.adcode if county else None,
+            "match_method": method, "match_confidence": confidence,
+        }
 
-    def get_code_by_name(self, name: object) -> Optional[str]:
-        if pd.isna(name):
-            return None
-        name_str = str(name).strip()
-        if not name_str:
-            return None
-
-        # 精确匹配
-        if name_str in self.exact_map:
-            return self.exact_map[name_str][0]
-
-        cleaned = clean_company_name(name_str)
-        if cleaned in self.exact_map:
-            return self.exact_map[cleaned][0]
-        if cleaned in self.clean_map:
-            return self.clean_map[cleaned][0]
-
-        # 进一步模糊匹配
-        candidates = [
-            code
-            for key, codes in self.clean_map.items()
-            if cleaned and len(cleaned) > 2 and (cleaned in key or key in cleaned)
-            for code in codes
-        ]
-        return candidates[0] if candidates else None
-
-    def get_company_info(self, code: str) -> Optional[pd.Series]:
-        if not code:
-            return None
-        matched = self.df[self.df["股票代码"] == code]
-        if matched.empty:
-            return None
-        return matched.iloc[0]
-
-    def get_location(self, code: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-        info = self.get_company_info(code)
-        if info is None:
-            return None, None, None
-        province = info.get(self.province_col) if self.province_col else None
-        city = info.get(self.city_col) if self.city_col else None
-        city_id = format_city(province, city)
-        return province, city, city_id
-
-    def build_city_company_counts(self) -> pd.Series:
-        if "city_id" not in self.location_df.columns:
-            return pd.Series(dtype=int)
-        return (
-            self.location_df.dropna(subset=["city_id"])
-            .groupby("city_id")["股票代码"]
-            .nunique()
-            .sort_values(ascending=False)
-        )
+    @staticmethod
+    def _empty(method: str) -> dict[str, object]:
+        return {
+            "province": None, "province_code": None, "city": None, "city_code": None,
+            "county": None, "county_code": None, "match_method": method,
+            "match_confidence": "unresolved",
+        }
 
 
-# ==================== 数据加载与清洗 ====================
-
-def load_data(
-    citation_path: Path, company_path: Path
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    print("=" * 80)
-    print("地级市创新合作网络构建系统".center(70))
-    print("=" * 80)
-
-    print("\n📂 Step 1: 加载数据...")
-
-    if not citation_path.exists():
-        raise FileNotFoundError(
-            f"未找到专利引用数据文件: {citation_path}. 请使用 --citation-file 指定正确路径。"
-        )
-    if not company_path.exists():
-        raise FileNotFoundError(
-            f"未找到上市公司信息文件: {company_path}. 请使用 --company-file 指定正确路径。"
-        )
-
-    citation_df = pd.read_excel(citation_path)
-    company_df = pd.read_excel(company_path)
-    print(f"   ✅ 专利引用数据加载成功: {len(citation_df)} 条记录")
-    print(f"   ✅ 上市公司数据加载成功: {len(company_df)} 家公司")
-
-    print("\n   数据预览 - 专利引用数据:")
-    preview_cols = citation_df.columns[: min(4, len(citation_df.columns))]
-    print(citation_df[preview_cols].head(3).to_string(index=False))
-    return citation_df, company_df
-
-
-def clean_citation_data(citation_df: pd.DataFrame) -> pd.DataFrame:
-    print("\n" + "=" * 80)
-    print("🧹 Step 2: 数据清洗与标准化...")
-
-    column_mapping = {
-        "证券代码": "证券代码",
-        "被引用年度": "被引用年度",
-        "引用方": "引用方",
-        "被引用次数": "被引用次数",
-    }
-    citation_df = citation_df.rename(columns=column_mapping)
-
-    required_cols = list(column_mapping.values())
-    missing_cols = [col for col in required_cols if col not in citation_df.columns]
-    if missing_cols:
-        raise ValueError(f"专利引用数据缺少必要列: {missing_cols}")
-
-    citation_df = citation_df.dropna(subset=["证券代码", "引用方"])
-    citation_df["证券代码"] = citation_df["证券代码"].map(normalize_code)
-    citation_df["引用方"] = citation_df["引用方"].astype(str).str.strip()
-    citation_df["被引用年度"] = pd.to_numeric(
-        citation_df["被引用年度"], errors="coerce"
-    ).astype("Int64")
-    citation_df["被引用次数"] = (
-        pd.to_numeric(citation_df["被引用次数"], errors="coerce")
-        .fillna(0)
-        .astype(int)
-    )
-
-    exclude_keywords = {
-        "上市公司本身小计",
-        "子公司小计",
-        "合营联营公司小计",
-        "上市公司及子公司合营联营公司合计",
-    }
-    citation_df = citation_df[~citation_df["引用方"].isin(exclude_keywords)].copy()
-
-    print(f"   ✅ 清洗后数据: {len(citation_df)} 条有效记录")
-    return citation_df
-
-
-def match_citing_company_codes(
-    citation_df: pd.DataFrame, company_index: CompanyIndex
+def map_companies(
+    companies: pd.DataFrame,
+    mapper: AddressMapper,
+    code_col: Optional[str] = None,
+    name_col: Optional[str] = None,
+    alias_col: Optional[str] = None,
+    address_col: Optional[str] = None,
 ) -> pd.DataFrame:
-    print("\n" + "=" * 80)
-    print("🔗 Step 3: 匹配引用方公司代码...")
-
-    citation_df = citation_df.copy()
-    citation_df["引用方代码"] = citation_df["引用方"].apply(company_index.get_code_by_name)
-
-    total_records = len(citation_df)
-    matched_records = citation_df["引用方代码"].notna().sum()
-    match_rate = matched_records / total_records * 100 if total_records else 0
-
-    print("   ✅ 匹配完成:")
-    print(f"      - 总记录数: {total_records}")
-    print(f"      - 成功匹配: {matched_records}")
-    print(f"      - 匹配率: {match_rate:.2f}%")
-
-    if matched_records < total_records:
-        unmatched = (
-            citation_df[citation_df["引用方代码"].isna()]["引用方"].value_counts().head(10)
-        )
-        if not unmatched.empty:
-            print("\n   ⚠️  未匹配的引用方示例 (Top 10):")
-            for company, count in unmatched.items():
-                print(f"      {company}: {int(count)} 次")
-
-    return citation_df
+    code_col = choose_column(companies, code_col, CODE_ALIASES, "company code")
+    name_col = choose_column(companies, name_col, NAME_ALIASES, "company name")
+    alias_col = choose_column(companies, alias_col, SHORT_NAME_ALIASES, "company alias", False)
+    address_col = choose_column(companies, address_col, ADDRESS_ALIASES, "company address")
+    result = pd.DataFrame({
+        "company_code": companies[code_col].map(normalize_code),
+        "company_name": companies[name_col],
+        "company_alias": companies[alias_col] if alias_col else None,
+        "address": companies[address_col],
+    })
+    mapped = pd.DataFrame([mapper.map_one(v) for v in result.address], index=result.index)
+    result = pd.concat([result, mapped], axis=1)
+    result["city_id"] = result.city_code
+    return result
 
 
-# ==================== 城市层面网络构建 ====================
-
-def build_city_level_edges(
-    citation_df: pd.DataFrame, company_index: CompanyIndex
-) -> pd.DataFrame:
-    print("\n" + "=" * 80)
-    print("🌐 Step 4: 构建地级市创新合作网络...")
-
-    df = citation_df.dropna(subset=["引用方代码"]).copy()
-    df = df[df["引用方代码"].astype(str).str.len() > 0]
-
-    edges = []
-    missing_location = 0
-
-    for _, row in df.iterrows():
-        target_code = row["证券代码"]
-        source_code = row["引用方代码"]
-        if not target_code or not source_code:
+def build_company_lookup(crosswalk: pd.DataFrame) -> tuple[dict[str, str], dict[str, str]]:
+    code_lookup = {
+        code: city for code, city in zip(crosswalk.company_code, crosswalk.city_code)
+        if pd.notna(code) and pd.notna(city)
+    }
+    name_lookup: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for row in crosswalk.itertuples(index=False):
+        if pd.isna(row.city_code):
             continue
-
-        target_province, target_city, target_city_id = company_index.get_location(
-            target_code
-        )
-        source_province, source_city, source_city_id = company_index.get_location(
-            source_code
-        )
-
-        if not target_city_id or not source_city_id:
-            missing_location += 1
-            continue
-
-        edges.append(
-            {
-                "source_city": source_city_id,
-                "target_city": target_city_id,
-                "source_province": source_province,
-                "source_city_name": source_city,
-                "target_province": target_province,
-                "target_city_name": target_city,
-                "year": int(row["被引用年度"]) if pd.notna(row["被引用年度"]) else None,
-                "citation_count": int(row["被引用次数"]),
-            }
-        )
-
-    if not edges:
-        raise ValueError("未能构建任何地级市层面的引用关系，请检查数据与匹配结果。")
-
-    edges_df = pd.DataFrame(edges)
-    edges_df = edges_df.dropna(subset=["year"])
-
-    city_network = (
-        edges_df.groupby(["source_city", "target_city", "year"], as_index=False)
-        .agg(
-            citation_count=("citation_count", "sum"),
-            source_province=("source_province", "first"),
-            source_city_name=("source_city_name", "first"),
-            target_province=("target_province", "first"),
-            target_city_name=("target_city_name", "first"),
-        )
-    )
-
-    # 排除同城自循环，聚焦跨城市合作
-    city_network = city_network[city_network["source_city"] != city_network["target_city"]]
-
-    total_citations = int(city_network["citation_count"].sum()) if not city_network.empty else 0
-    nodes = set(city_network["source_city"]) | set(city_network["target_city"])
-    avg_weight = city_network["citation_count"].mean() if not city_network.empty else 0
-
-    print("   ✅ 网络构建完成:")
-    print(f"      - 地级市节点数: {len(nodes)}")
-    print(f"      - 城市间边数: {len(city_network)}")
-    print(f"      - 总引用次数: {total_citations}")
-    print(f"      - 平均每条边引用次数: {avg_weight:.2f}")
-    print(f"      - 缺失地理信息记录数: {missing_location}")
-
-    if city_network.empty:
-        print("      ⚠️ 城市间合作数据为空（可能仅存在同城引用或缺少地理信息）")
-
-    return city_network
-
-
-def analyze_city_network(
-    edges_df: pd.DataFrame, year: int
-) -> Tuple[Optional[Dict[str, object]], list, list, Optional[nx.DiGraph]]:
-    df_year = edges_df[edges_df["year"] == year]
-    if df_year.empty:
-        print(f"   ⚠️  {year} 年无城市层面的引用数据")
-        return None, [], [], None
-
-    G = nx.DiGraph()
-    for _, row in df_year.iterrows():
-        G.add_edge(
-            row["source_city"],
-            row["target_city"],
-            weight=row["citation_count"],
-        )
-
-    if G.number_of_nodes() == 0:
-        print(f"   ⚠️  {year} 年网络为空")
-        return None, [], [], G
-
-    avg_degree = (
-        sum(dict(G.degree()).values()) / G.number_of_nodes()
-        if G.number_of_nodes() > 0
-        else 0
-    )
-
-    stats = {
-        "年份": year,
-        "节点数": G.number_of_nodes(),
-        "边数": G.number_of_edges(),
-        "平均度": round(avg_degree, 2),
-        "网络密度": round(nx.density(G), 4),
-        "弱连通分量数": nx.number_weakly_connected_components(G),
-        "强连通分量数": nx.number_strongly_connected_components(G),
-    }
-
-    in_degree = dict(G.in_degree(weight="weight"))
-    out_degree = dict(G.out_degree(weight="weight"))
-    top_in = sorted(in_degree.items(), key=lambda x: x[1], reverse=True)[:10]
-    top_out = sorted(out_degree.items(), key=lambda x: x[1], reverse=True)[:10]
-
-    return stats, top_in, top_out, G
-
-
-def compute_time_evolution(edges_df: pd.DataFrame) -> pd.DataFrame:
-    if edges_df.empty:
-        print("\n" + "=" * 80)
-        print("⏰ Step 7: 时间演化分析...")
-        print("   ⚠️ 城市间引用数据为空，无法进行时间演化分析")
-        return pd.DataFrame(
-            columns=["year", "nodes", "edges", "avg_degree", "density", "total_citations"]
-        )
-
-    years = sorted(edges_df["year"].dropna().unique())
-    if not years:
-        print("\n" + "=" * 80)
-        print("⏰ Step 7: 时间演化分析...")
-        print("   ⚠️ 缺少年份信息，无法进行时间演化分析")
-        return pd.DataFrame(
-            columns=["year", "nodes", "edges", "avg_degree", "density", "total_citations"]
-        )
-    print("\n" + "=" * 80)
-    print("⏰ Step 7: 时间演化分析...")
-    print(f"   📅 数据覆盖年份: {years[0]} - {years[-1]}")
-
-    records = []
-    for year in years:
-        df_year = edges_df[edges_df["year"] == year]
-        G_year = nx.DiGraph()
-        for _, row in df_year.iterrows():
-            G_year.add_edge(
-                row["source_city"],
-                row["target_city"],
-                weight=row["citation_count"],
-            )
-
-        avg_degree = (
-            sum(dict(G_year.degree()).values()) / G_year.number_of_nodes()
-            if G_year.number_of_nodes() > 0
-            else 0
-        )
-
-        records.append(
-            {
-                "year": year,
-                "nodes": G_year.number_of_nodes(),
-                "edges": G_year.number_of_edges(),
-                "avg_degree": avg_degree,
-                "density": nx.density(G_year) if G_year.number_of_nodes() > 0 else 0,
-                "total_citations": int(df_year["citation_count"].sum()),
-            }
-        )
-
-    evolution_df = pd.DataFrame(records)
-    print("\n   📊 网络演化趋势:")
-    print(evolution_df.to_string(index=False))
-    return evolution_df
-
-
-def plot_time_evolution(evolution_df: pd.DataFrame, output_dir: Path) -> None:
-    if evolution_df.empty:
-        return
-
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle("地级市创新合作网络时间演化分析", fontsize=16, fontweight="bold")
-
-    axes[0, 0].plot(
-        evolution_df["year"],
-        evolution_df["nodes"],
-        marker="o",
-        linewidth=2,
-        markersize=6,
-        color="#2E86AB",
-    )
-    axes[0, 0].set_title("节点数（地级市数量）变化", fontsize=12, fontweight="bold")
-    axes[0, 0].set_xlabel("年份")
-    axes[0, 0].set_ylabel("节点数")
-    axes[0, 0].grid(True, alpha=0.3)
-
-    axes[0, 1].plot(
-        evolution_df["year"],
-        evolution_df["edges"],
-        marker="s",
-        linewidth=2,
-        markersize=6,
-        color="#A23B72",
-    )
-    axes[0, 1].set_title("边数（城市合作关系）变化", fontsize=12, fontweight="bold")
-    axes[0, 1].set_xlabel("年份")
-    axes[0, 1].set_ylabel("边数")
-    axes[0, 1].grid(True, alpha=0.3)
-
-    axes[0, 2].plot(
-        evolution_df["year"],
-        evolution_df["avg_degree"],
-        marker="^",
-        linewidth=2,
-        markersize=6,
-        color="#F18F01",
-    )
-    axes[0, 2].set_title("平均度变化", fontsize=12, fontweight="bold")
-    axes[0, 2].set_xlabel("年份")
-    axes[0, 2].set_ylabel("平均度")
-    axes[0, 2].grid(True, alpha=0.3)
-
-    axes[1, 0].plot(
-        evolution_df["year"],
-        evolution_df["density"],
-        marker="d",
-        linewidth=2,
-        markersize=6,
-        color="#C73E1D",
-    )
-    axes[1, 0].set_title("网络密度变化", fontsize=12, fontweight="bold")
-    axes[1, 0].set_xlabel("年份")
-    axes[1, 0].set_ylabel("密度")
-    axes[1, 0].grid(True, alpha=0.3)
-
-    axes[1, 1].plot(
-        evolution_df["year"],
-        evolution_df["total_citations"],
-        marker="*",
-        linewidth=2,
-        markersize=8,
-        color="#6A994E",
-    )
-    axes[1, 1].set_title("总引用次数变化", fontsize=12, fontweight="bold")
-    axes[1, 1].set_xlabel("年份")
-    axes[1, 1].set_ylabel("引用次数")
-    axes[1, 1].grid(True, alpha=0.3)
-
-    growth_rate = (evolution_df["edges"].pct_change() * 100).iloc[1:]
-    axes[1, 2].bar(
-        evolution_df["year"].iloc[1:],
-        growth_rate.fillna(0),
-        color="#BC4B51",
-        alpha=0.7,
-    )
-    axes[1, 2].axhline(y=0, color="black", linestyle="--", linewidth=0.8)
-    axes[1, 2].set_title("边数增长率 (%)", fontsize=12, fontweight="bold")
-    axes[1, 2].set_xlabel("年份")
-    axes[1, 2].set_ylabel("增长率 (%)")
-    axes[1, 2].grid(True, alpha=0.3, axis="y")
-
-    plt.tight_layout()
-    output_path = output_dir / "地级市创新合作网络_时间演化.png"
-    plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    print(f"\n   ✅ 演化趋势图已保存: {output_path}")
-    plt.close(fig)
-
-
-def visualize_city_network(G: nx.DiGraph, year: int, output_dir: Path) -> None:
-    if G is None or G.number_of_nodes() == 0:
-        return
-
-    degree_centrality = nx.degree_centrality(G)
-    top_nodes = sorted(degree_centrality.items(), key=lambda x: x[1], reverse=True)[:40]
-    sub_nodes = [node for node, _ in top_nodes]
-    G_sub = G.subgraph(sub_nodes).copy()
-
-    print(f"   🔄 绘制 {year} 年核心城市创新合作网络（Top 40 节点）...")
-
-    pos = nx.spring_layout(G_sub, k=3, iterations=50, seed=42)
-    in_degrees = dict(G_sub.in_degree(weight="weight"))
-    node_sizes = [max(in_degrees.get(node, 1) * 10, 100) for node in G_sub.nodes()]
-    node_colors = [degree_centrality.get(node, 0) for node in G_sub.nodes()]
-
-    plt.figure(figsize=(24, 20))
-    nx.draw_networkx_edges(
-        G_sub,
-        pos,
-        edge_color="gray",
-        alpha=0.2,
-        arrows=True,
-        arrowsize=15,
-        width=0.8,
-        arrowstyle="->",
-    )
-    nodes = nx.draw_networkx_nodes(
-        G_sub,
-        pos,
-        node_size=node_sizes,
-        node_color=node_colors,
-        cmap=plt.cm.YlOrRd,
-        alpha=0.9,
-        edgecolors="black",
-        linewidths=1.2,
-    )
-
-    labels = {node: node for node in G_sub.nodes()}
-    nx.draw_networkx_labels(
-        G_sub,
-        pos,
-        labels,
-        font_size=9,
-        font_color="black",
-        font_weight="bold",
-    )
-
-    plt.colorbar(nodes, label="度中心性", shrink=0.8)
-    plt.title(
-        f"地级市创新合作网络（{year} 年 Top 40 核心城市）",
-        fontsize=20,
-        fontweight="bold",
-        pad=20,
-    )
-    plt.axis("off")
-    plt.tight_layout()
-
-    output_path = output_dir / f"地级市创新合作网络可视化_{year}.png"
-    plt.savefig(output_path, dpi=300, bbox_inches="tight", facecolor="white")
-    print(f"   ✅ 网络可视化图已保存: {output_path}")
-    plt.close()
-
-
-# ==================== 报告与结果保存 ====================
-
-def build_node_table(
-    edges_df: pd.DataFrame,
-    company_index: CompanyIndex,
-    overall_graph: nx.DiGraph,
-) -> pd.DataFrame:
-    company_counts = company_index.build_city_company_counts()
-
-    in_citations = (
-        edges_df.groupby("target_city")["citation_count"].sum().rename("in_citations")
-    )
-    out_citations = (
-        edges_df.groupby("source_city")["citation_count"].sum().rename("out_citations")
-    )
-
-    unique_inbound = (
-        edges_df.groupby("target_city")["source_city"].nunique().rename("unique_inbound_cities")
-    )
-    unique_outbound = (
-        edges_df.groupby("source_city")["target_city"].nunique().rename(
-            "unique_outbound_cities"
-        )
-    )
-
-    location_lookup: Dict[str, Dict[str, Optional[str]]] = {}
-    if "city_id" in company_index.location_df.columns:
-        province_col = company_index.province_col
-        city_col = company_index.city_col
-        for _, row in company_index.location_df.dropna(subset=["city_id"]).iterrows():
-            city_id = row["city_id"]
-            if city_id in location_lookup:
+        for value in (row.company_name, row.company_alias):
+            key = normalize_name(value)
+            if not key:
                 continue
-            province = row[province_col] if province_col and province_col in row.index else None
-            city_name = row[city_col] if city_col and city_col in row.index else None
-            location_lookup[city_id] = {
-                "province": province,
-                "city_name": city_name,
-            }
+            if key in name_lookup and name_lookup[key] != row.city_code:
+                ambiguous.add(key)
+            else:
+                name_lookup[key] = row.city_code
+    for key in ambiguous:
+        name_lookup.pop(key, None)
+    return code_lookup, name_lookup
 
-    records = []
-    for city in sorted(set(edges_df["source_city"]) | set(edges_df["target_city"])):
-        info = location_lookup.get(city, {})
-        province = info.get("province")
-        city_name = info.get("city_name") or city
 
-        company_count = int(company_counts.get(city, 0)) if not company_counts.empty else 0
-        records.append(
-            {
-                "city_id": city,
-                "province": province,
-                "city_name": city_name,
-                "listed_company_count": company_count,
-                "in_citations": int(in_citations.get(city, 0)),
-                "out_citations": int(out_citations.get(city, 0)),
-                "total_citations": int(in_citations.get(city, 0) + out_citations.get(city, 0)),
-                "unique_inbound_cities": int(unique_inbound.get(city, 0)),
-                "unique_outbound_cities": int(unique_outbound.get(city, 0)),
-            }
-        )
+def prepare_company_edges(
+    links: pd.DataFrame, crosswalk: pd.DataFrame, args: argparse.Namespace,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    source_code_col = choose_column(links, args.source_code_col, SOURCE_CODE_ALIASES, "source code", False)
+    target_code_col = choose_column(links, args.target_code_col, TARGET_CODE_ALIASES, "target code", False)
+    source_name_col = choose_column(links, args.source_name_col, SOURCE_NAME_ALIASES, "source name", False)
+    target_name_col = choose_column(links, args.target_name_col, TARGET_NAME_ALIASES, "target name", False)
+    if not (source_code_col or source_name_col) or not (target_code_col or target_name_col):
+        raise ValueError("Links need source and target identifiers (codes and/or names)")
+    year_col = choose_column(links, args.year_col, YEAR_ALIASES, "year")
+    weight_col = choose_column(links, args.weight_col, WEIGHT_ALIASES, "weight", False)
+    patent_col = choose_column(links, args.patent_col, PATENT_ALIASES, "patent id", False)
+    code_lookup, name_lookup = build_company_lookup(crosswalk)
+    work = links.copy()
+    work["source_code"] = work[source_code_col].map(normalize_code) if source_code_col else None
+    work["target_code"] = work[target_code_col].map(normalize_code) if target_code_col else None
+    work["source_name"] = work[source_name_col] if source_name_col else None
+    work["target_name"] = work[target_name_col] if target_name_col else None
+    work["year"] = pd.to_numeric(work[year_col], errors="coerce").astype("Int64")
+    work["weight"] = pd.to_numeric(work[weight_col], errors="coerce").fillna(1.0) if weight_col else 1.0
+    work["patent_id"] = work[patent_col] if patent_col else None
 
-    nodes_df = pd.DataFrame(records)
+    def resolve(code: object, name: object) -> Optional[str]:
+        normalized_code = normalize_code(code)
+        if normalized_code in code_lookup:
+            return code_lookup[normalized_code]
+        normalized_name = normalize_name(name)
+        return name_lookup.get(normalized_name) if normalized_name else None
 
-    if overall_graph.number_of_nodes() > 0:
-        betweenness = nx.betweenness_centrality(overall_graph, weight="weight")
-        degree_centrality = nx.degree_centrality(overall_graph)
-        nodes_df["betweenness_centrality"] = nodes_df["city_id"].map(betweenness).fillna(0)
-        nodes_df["degree_centrality"] = nodes_df["city_id"].map(degree_centrality).fillna(0)
+    work["source_city_code"] = [resolve(c, n) for c, n in zip(work.source_code, work.source_name)]
+    work["target_city_code"] = [resolve(c, n) for c, n in zip(work.target_code, work.target_name)]
+
+    def reason(row: pd.Series) -> str:
+        if pd.isna(row.year):
+            return "missing_year"
+        if pd.isna(row.source_city_code):
+            return "unmapped_source"
+        if pd.isna(row.target_city_code):
+            return "unmapped_target"
+        if row.source_city_code == row.target_city_code and not args.include_intra_city:
+            return "intra_city"
+        return "included"
+
+    audit = work.copy()
+    audit["exclusion_reason"] = audit.apply(reason, axis=1)
+    return work.loc[audit.exclusion_reason == "included"].copy(), audit
+
+
+def build_repaco_pairs(repaco: Optional[pd.DataFrame]) -> set[tuple[str, str]]:
+    """Return normalized (listed code, group-member name) pairs."""
+    if repaco is None:
+        return set()
+    code_col = choose_column(repaco, None, CODE_ALIASES, "Repaco listed-company code")
+    name_col = choose_column(repaco, None, NAME_ALIASES, "Repaco member name")
+    return {
+        (code, name)
+        for code, name in zip(repaco[code_col].map(normalize_code), repaco[name_col].map(normalize_name))
+        if code and name
+    }
+
+
+def prepare_coapplication_edges(
+    links: pd.DataFrame,
+    crosswalk: pd.DataFrame,
+    mapper: AddressMapper,
+    repaco: Optional[pd.DataFrame],
+    args: argparse.Namespace,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Prepare one-listed-company/one-partner/one-patent records.
+
+    Each patent-city pair is deduplicated before aggregation, so repeated API
+    rows or multiple applicants from the same two cities cannot inflate weight.
+    """
+    source_code_col = choose_column(
+        links, args.source_code_col, SOURCE_CODE_ALIASES + CODE_ALIASES, "listed-company code", False
+    )
+    target_code_col = choose_column(
+        links, args.target_code_col, TARGET_CODE_ALIASES, "partner code", False
+    )
+    source_name_col = choose_column(
+        links, args.source_name_col, SOURCE_NAME_ALIASES + NAME_ALIASES, "listed-company name", False
+    )
+    target_name_col = choose_column(
+        links, args.target_name_col, TARGET_NAME_ALIASES, "partner name", False
+    )
+    target_address_col = choose_column(
+        links, args.target_address_col, TARGET_ADDRESS_ALIASES, "partner address", False
+    )
+    patent_col = choose_column(links, args.patent_col, PATENT_ALIASES, "patent id")
+    year_col = choose_column(links, args.year_col, YEAR_ALIASES, "application year", False)
+    date_col = choose_column(links, args.date_col, DATE_ALIASES, "application date", False)
+    if not (source_code_col or source_name_col):
+        raise ValueError("Co-application data need a listed-company code or name")
+    if not (target_code_col or target_name_col):
+        raise ValueError("Co-application data need a partner code or name")
+    if not (year_col or date_col):
+        raise ValueError("Co-application data need an application year or date")
+
+    code_lookup, name_lookup = build_company_lookup(crosswalk)
+    city_by_code = crosswalk.drop_duplicates("city_code").set_index("city_code")["city"].to_dict()
+    group_pairs = build_repaco_pairs(repaco)
+    work = links.copy()
+    work["source_code"] = work[source_code_col].map(normalize_code) if source_code_col else None
+    work["target_code"] = work[target_code_col].map(normalize_code) if target_code_col else None
+    work["source_name"] = work[source_name_col] if source_name_col else None
+    work["target_name"] = work[target_name_col] if target_name_col else None
+    work["target_address"] = work[target_address_col] if target_address_col else None
+    work["patent_id"] = work[patent_col].astype("string").str.strip()
+    if year_col:
+        work["year"] = pd.to_numeric(work[year_col], errors="coerce").astype("Int64")
     else:
-        nodes_df["betweenness_centrality"] = 0
-        nodes_df["degree_centrality"] = 0
+        work["year"] = pd.to_datetime(work[date_col], errors="coerce").dt.year.astype("Int64")
 
-    nodes_df = nodes_df.sort_values("total_citations", ascending=False)
-    return nodes_df
+    def lookup_city(code: object, name: object) -> Optional[str]:
+        normalized_code = normalize_code(code)
+        if normalized_code and normalized_code in code_lookup:
+            return code_lookup[normalized_code]
+        normalized_name = normalize_name(name)
+        return name_lookup.get(normalized_name) if normalized_name else None
 
+    work["source_city_code"] = [
+        lookup_city(c, n) for c, n in zip(work.source_code, work.source_name)
+    ]
+    target_city_codes: list[Optional[str]] = []
+    target_location_methods: list[str] = []
+    for code, name, address in zip(work.target_code, work.target_name, work.target_address):
+        city_code = lookup_city(code, name)
+        if city_code:
+            target_city_codes.append(city_code)
+            target_location_methods.append("listed_company_lookup")
+        elif pd.notna(address) and str(address).strip():
+            mapped = mapper.map_one(address)
+            target_city_codes.append(mapped["city_code"])
+            target_location_methods.append(f"address:{mapped['match_method']}")
+        else:
+            target_city_codes.append(None)
+            target_location_methods.append("unresolved")
+    work["target_city_code"] = target_city_codes
+    work["target_location_method"] = target_location_methods
+    work["same_group"] = [
+        (normalize_code(code), normalize_name(name)) in group_pairs
+        for code, name in zip(work.source_code, work.target_name)
+    ]
 
-def save_outputs(
-    city_network: pd.DataFrame,
-    nodes_table: pd.DataFrame,
-    evolution_df: pd.DataFrame,
-    stats: Optional[Dict[str, object]],
-    top_in: list,
-    top_out: list,
-    top_bridges: list,
-    output_dir: Path,
-) -> None:
-    edges_output = output_dir / "地级市创新合作网络_边表.csv"
-    city_network.to_csv(edges_output, index=False, encoding="utf-8-sig")
-    print(f"   ✅ 城市层面边表已保存: {edges_output}")
+    def reason(row: pd.Series) -> str:
+        if pd.isna(row.patent_id) or not str(row.patent_id).strip():
+            return "missing_patent_id"
+        if pd.isna(row.year):
+            return "missing_year"
+        if pd.isna(row.source_city_code):
+            return "unmapped_listed_company"
+        if row.same_group:
+            return "same_corporate_group"
+        if pd.isna(row.target_city_code):
+            return "unmapped_partner_city"
+        if row.source_city_code == row.target_city_code and not args.include_intra_city:
+            return "intra_city"
+        return "included"
 
-    nodes_output = output_dir / "地级市创新合作网络_节点表.csv"
-    nodes_table.to_csv(nodes_output, index=False, encoding="utf-8-sig")
-    print(f"   ✅ 城市层面节点表已保存: {nodes_output}")
-
-    evolution_output = output_dir / "地级市创新合作网络_时间演化.csv"
-    evolution_df.to_csv(evolution_output, index=False, encoding="utf-8-sig")
-    print(f"   ✅ 时间演化数据已保存: {evolution_output}")
-
-    report_output = output_dir / "地级市创新合作网络_分析报告.txt"
-    with report_output.open("w", encoding="utf-8") as f:
-        f.write("=" * 80 + "\n")
-        f.write("地级市创新合作网络分析报告\n")
-        f.write("=" * 80 + "\n\n")
-
-        f.write("一、网络基本统计\n")
-        f.write("-" * 80 + "\n")
-        f.write(f"地级市节点数: {len(set(city_network['source_city']) | set(city_network['target_city']))}\n")
-        f.write(f"城市间边数: {len(city_network)}\n")
-        f.write(f"总引用次数: {int(city_network['citation_count'].sum())}\n\n")
-
-        if stats:
-            f.write("二、{0} 年网络指标\n".format(stats.get("年份")))
-            f.write("-" * 80 + "\n")
-            for key, value in stats.items():
-                if key == "年份":
-                    continue
-                f.write(f"{key}: {value}\n")
-            f.write("\n")
-
-        f.write("三、被引用最频繁的地级市 (Top 10)\n")
-        f.write("-" * 80 + "\n")
-        for i, (city, count) in enumerate(top_in, 1):
-            f.write(f"{i}. {city}: {int(count)} 次\n")
-        f.write("\n")
-
-        f.write("四、引用最活跃的地级市 (Top 10)\n")
-        f.write("-" * 80 + "\n")
-        for i, (city, count) in enumerate(top_out, 1):
-            f.write(f"{i}. {city}: {int(count)} 次\n")
-        f.write("\n")
-
-        f.write("五、技术知识流动关键枢纽 (Top 10)\n")
-        f.write("-" * 80 + "\n")
-        for i, (city, score) in enumerate(top_bridges, 1):
-            f.write(f"{i}. {city}: {score:.4f}\n")
-
-    print(f"   ✅ 分析报告已保存: {report_output}")
-
-
-# ==================== 主流程 ====================
-
-def run_workflow(
-    citation_path: Path,
-    company_path: Path,
-    output_dir: Path,
-    target_year: int,
-) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    citation_df, company_df = load_data(citation_path, company_path)
-    citation_df = clean_citation_data(citation_df)
-    company_index = CompanyIndex(company_df)
-    citation_df = match_citing_company_codes(citation_df, company_index)
-    city_network = build_city_level_edges(citation_df, company_index)
-
-    print("\n" + "=" * 80)
-    print("📊 Step 5: 地级市网络深度分析...")
-
-    stats, top_in, top_out, G_year = analyze_city_network(city_network, target_year)
-    if stats:
-        print(f"\n   📈 {stats['年份']} 年网络统计指标:")
-        for key, value in stats.items():
-            if key != "年份":
-                print(f"      - {key}: {value}")
-
-    if top_in:
-        print(f"\n   🏆 被引用最频繁的地级市 (Top 10):")
-        for i, (city, count) in enumerate(top_in, 1):
-            print(f"      {i}. {city}: {int(count)} 次")
-
-    if top_out:
-        print(f"\n   🔥 引用最活跃的地级市 (Top 10):")
-        for i, (city, count) in enumerate(top_out, 1):
-            print(f"      {i}. {city}: {int(count)} 次")
-
-    top_bridges: list[Tuple[str, float]] = []
-    if G_year and G_year.number_of_nodes() > 0:
-        print("\n" + "=" * 80)
-        print("🏘️  Step 6: 识别城市创新社区...")
-        betweenness = nx.betweenness_centrality(G_year, weight="weight")
-        top_bridges = sorted(betweenness.items(), key=lambda x: x[1], reverse=True)[:10]
-
-        if top_bridges:
-            print("\n   🌉 技术知识流动的枢纽城市 (Top 10):")
-            for i, (city, score) in enumerate(top_bridges, 1):
-                print(f"      {i}. {city}: {score:.4f}")
-
-        G_undirected = G_year.to_undirected()
-        communities = list(nx.community.greedy_modularity_communities(G_undirected))
-        print(f"\n   ✅ 检测到 {len(communities)} 个城市创新社区")
-        for i, community in enumerate(sorted(communities, key=len, reverse=True)[:5], 1):
-            members = sorted(list(community))
-            print(f"\n      社区 {i} (规模: {len(members)} 座城市):")
-            for city in members[:5]:
-                print(f"         - {city}")
-            if len(members) > 5:
-                print(f"         ... 还有 {len(members) - 5} 座城市")
-
-    evolution_df = compute_time_evolution(city_network)
-    plot_time_evolution(evolution_df, output_dir)
-
-    if G_year and G_year.number_of_nodes() > 0:
-        print("\n" + "=" * 80)
-        print("🎨 Step 8: 网络可视化...")
-        visualize_city_network(G_year, target_year, output_dir)
-
-    overall_edges = (
-        city_network.groupby(["source_city", "target_city"], as_index=False)
-        .agg({"citation_count": "sum"})
-    )
-    G_overall = nx.DiGraph()
-    for _, row in overall_edges.iterrows():
-        G_overall.add_edge(
-            row["source_city"],
-            row["target_city"],
-            weight=row["citation_count"],
+    audit = work.copy()
+    audit["exclusion_reason"] = audit.apply(reason, axis=1)
+    valid = audit[audit.exclusion_reason == "included"].copy()
+    if not valid.empty:
+        canonical = valid[["source_city_code", "target_city_code"]].apply(
+            lambda r: sorted((r.iloc[0], r.iloc[1])), axis=1, result_type="expand"
         )
-
-    nodes_table = build_node_table(city_network, company_index, G_overall)
-
-    print("\n" + "=" * 80)
-    print("💾 Step 10: 保存分析结果...")
-    save_outputs(
-        city_network,
-        nodes_table,
-        evolution_df,
-        stats,
-        top_in,
-        top_out,
-        top_bridges,
-        output_dir,
-    )
-
-    print("\n" + "=" * 80)
-    print("✅ 地级市创新合作网络构建与分析完成！".center(70))
-    print("=" * 80)
-
-    print(f"\n📁 生成的文件 (位于 {output_dir.resolve()}):")
-    print("   1. 地级市创新合作网络_边表.csv")
-    print("   2. 地级市创新合作网络_节点表.csv")
-    print("   3. 地级市创新合作网络_时间演化.csv")
-    print("   4. 地级市创新合作网络_分析报告.txt")
-    print("   5. 地级市创新合作网络_时间演化.png")
-    if G_year and G_year.number_of_nodes() > 0:
-        print(f"   6. 地级市创新合作网络可视化_{target_year}.png")
+        valid[["source_city_code", "target_city_code"]] = canonical
+        valid["source_city"] = valid.source_city_code.map(city_by_code)
+        valid["target_city"] = valid.target_city_code.map(city_by_code)
+        valid = valid.drop_duplicates(
+            ["patent_id", "year", "source_city_code", "target_city_code"]
+        )
+        valid["weight"] = 1.0
+    return valid, audit
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="构建基于上市公司专利引用的地级市创新合作网络"
+def aggregate_city_network(
+    company_edges: pd.DataFrame, crosswalk: pd.DataFrame, directed: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    edges = company_edges.copy()
+    if not directed:
+        pairs = edges[["source_city_code", "target_city_code"]].apply(
+            lambda r: sorted((r.iloc[0], r.iloc[1])), axis=1, result_type="expand"
+        )
+        edges[["source_city_code", "target_city_code"]] = pairs
+    city_edges = edges.groupby(
+        ["year", "source_city_code", "target_city_code"], as_index=False
+    ).agg(weight=("weight", "sum"), company_link_records=("weight", "size"))
+    names = (
+        crosswalk.dropna(subset=["city_code"]).drop_duplicates("city_code")
+        .set_index("city_code")[["province", "city"]]
     )
-    parser.add_argument(
-        "--citation-file",
-        type=Path,
-        default=DEFAULT_CITATION_FILE,
-        help="专利引用数据 Excel 文件路径 (默认: 脚本同目录)",
+    city_edges["source_city"] = city_edges.source_city_code.map(names.city)
+    city_edges["target_city"] = city_edges.target_city_code.map(names.city)
+    city_edges["source_province"] = city_edges.source_city_code.map(names.province)
+    city_edges["target_province"] = city_edges.target_city_code.map(names.province)
+    node_rows: list[dict[str, object]] = []
+    summary_rows: list[dict[str, object]] = []
+    graph_type = nx.DiGraph if directed else nx.Graph
+    for year, year_edges in city_edges.groupby("year", sort=True):
+        graph = graph_type()
+        for row in year_edges.itertuples(index=False):
+            graph.add_edge(row.source_city_code, row.target_city_code, weight=float(row.weight))
+        degree = dict(graph.degree())
+        strength = dict(graph.degree(weight="weight"))
+        betweenness = nx.betweenness_centrality(graph, weight=None, normalized=True)
+        pagerank = nx.pagerank(graph, weight="weight") if graph.number_of_nodes() else {}
+        clustering = nx.clustering(graph.to_undirected(), weight="weight")
+        for code in graph.nodes:
+            node_rows.append({
+                "year": int(year), "city_code": code,
+                "province": names.at[code, "province"], "city": names.at[code, "city"],
+                "degree": degree[code], "weighted_degree": strength[code],
+                "betweenness": betweenness[code], "pagerank": pagerank[code],
+                "clustering": clustering[code],
+            })
+        summary_rows.append({
+            "year": int(year), "nodes": graph.number_of_nodes(),
+            "edges": graph.number_of_edges(), "total_weight": float(year_edges.weight.sum()),
+            "density": nx.density(graph),
+            "components": nx.number_weakly_connected_components(graph)
+            if directed else nx.number_connected_components(graph),
+        })
+    return city_edges, pd.DataFrame(node_rows), pd.DataFrame(summary_rows)
+
+
+def write_csv(frame: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(path, index=False, encoding="utf-8-sig")
+
+
+def command_map(args: argparse.Namespace) -> None:
+    mapper = AddressMapper(args.adcodes or default_adcodes_path())
+    crosswalk = map_companies(
+        read_table(args.companies), mapper, args.code_col, args.name_col,
+        args.alias_col, args.address_col,
     )
-    parser.add_argument(
-        "--company-file",
-        type=Path,
-        default=DEFAULT_COMPANY_FILE,
-        help="上市公司基本信息 Excel 文件路径 (默认: 脚本同目录)",
+    write_csv(crosswalk, args.output)
+    write_csv(crosswalk[crosswalk.city_code.isna()], args.audit_output)
+    city_counts = (
+        crosswalk.dropna(subset=["city_code"])
+        .groupby(["province", "province_code", "city", "city_code"], as_index=False)
+        .agg(
+            listed_company_count=("company_code", "nunique"),
+            high_confidence_count=(
+                "match_confidence", lambda values: int((values == "high").sum())
+            ),
+            medium_confidence_count=(
+                "match_confidence", lambda values: int((values == "medium").sum())
+            ),
+        )
+        .sort_values("listed_company_count", ascending=False)
     )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=DEFAULT_OUTPUT_DIR,
-        help="输出结果目录 (默认: 脚本同目录的 outputs/)",
+    city_counts_path = args.output.with_name("city_listed_company_counts.csv")
+    write_csv(city_counts, city_counts_path)
+    mapped = crosswalk.city_code.notna().sum()
+    print(f"Mapped {mapped:,}/{len(crosswalk):,} companies ({mapped / len(crosswalk):.2%})")
+    print(f"Crosswalk: {args.output}")
+    print(f"City counts: {city_counts_path}")
+    print(f"Unresolved audit: {args.audit_output}")
+
+
+def command_network(args: argparse.Namespace) -> None:
+    mapper = AddressMapper(args.adcodes or default_adcodes_path())
+    crosswalk = map_companies(
+        read_table(args.companies), mapper, args.code_col, args.name_col,
+        args.alias_col, args.address_col,
     )
-    parser.add_argument(
-        "--target-year",
-        type=int,
-        default=DEFAULT_TARGET_YEAR,
-        help="进行详细分析与可视化的年份 (默认: 2020)",
+    company_edges, audit = prepare_company_edges(read_table(args.links), crosswalk, args)
+    if company_edges.empty:
+        raise ValueError(
+            f"No valid company links remain after mapping: {audit.exclusion_reason.value_counts().to_dict()}"
+        )
+    city_edges, city_nodes, evolution = aggregate_city_network(company_edges, crosswalk, args.directed)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    write_csv(crosswalk, args.output_dir / "company_city_crosswalk.csv")
+    write_csv(audit, args.output_dir / "company_link_audit.csv")
+    write_csv(city_edges, args.output_dir / "city_innovation_edges.csv")
+    write_csv(city_nodes, args.output_dir / "city_innovation_nodes.csv")
+    write_csv(evolution, args.output_dir / "city_network_evolution.csv")
+    print(evolution.to_string(index=False))
+    print(f"Outputs: {args.output_dir}")
+
+
+def command_coapplication(args: argparse.Namespace) -> None:
+    mapper = AddressMapper(args.adcodes or default_adcodes_path())
+    crosswalk = map_companies(
+        read_table(args.companies), mapper, args.code_col, args.name_col,
+        args.alias_col, args.address_col,
     )
-    return parser.parse_args()
+    repaco = read_table(args.repaco) if args.repaco else None
+    patent_edges, audit = prepare_coapplication_edges(
+        read_table(args.links), crosswalk, mapper, repaco, args
+    )
+    if patent_edges.empty:
+        raise ValueError(
+            "No valid inter-city co-application links remain: "
+            f"{audit.exclusion_reason.value_counts().to_dict()}"
+        )
+    city_edges, city_nodes, evolution = aggregate_city_network(
+        patent_edges, crosswalk, directed=False
+    )
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    write_csv(crosswalk, args.output_dir / "company_city_crosswalk.csv")
+    write_csv(audit, args.output_dir / "coapplication_record_audit.csv")
+    write_csv(patent_edges, args.output_dir / "patent_city_pairs_deduplicated.csv")
+    write_csv(city_edges, args.output_dir / "city_coapplication_edges.csv")
+    write_csv(city_nodes, args.output_dir / "city_coapplication_nodes.csv")
+    write_csv(evolution, args.output_dir / "city_coapplication_evolution.csv")
+    print(evolution.to_string(index=False))
+    print("Audit:", audit.exclusion_reason.value_counts().to_dict())
+    print(f"Outputs: {args.output_dir}")
+
+
+def add_mapping_columns(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--companies", type=Path, required=True)
+    parser.add_argument("--adcodes", type=Path)
+    parser.add_argument("--code-col")
+    parser.add_argument("--name-col")
+    parser.add_argument("--alias-col")
+    parser.add_argument("--address-col")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    map_parser = subparsers.add_parser("map-companies", help="create company--city crosswalk")
+    add_mapping_columns(map_parser)
+    map_parser.add_argument("--output", type=Path, required=True)
+    map_parser.add_argument("--audit-output", type=Path, required=True)
+    map_parser.set_defaults(func=command_map)
+    net_parser = subparsers.add_parser("build-network", help="aggregate company links by city/year")
+    add_mapping_columns(net_parser)
+    net_parser.add_argument("--links", type=Path, required=True)
+    net_parser.add_argument("--output-dir", type=Path, required=True)
+    net_parser.add_argument("--source-code-col")
+    net_parser.add_argument("--target-code-col")
+    net_parser.add_argument("--source-name-col")
+    net_parser.add_argument("--target-name-col")
+    net_parser.add_argument("--year-col")
+    net_parser.add_argument("--weight-col")
+    net_parser.add_argument("--patent-col")
+    net_parser.add_argument("--directed", action="store_true", help="retain citation direction")
+    net_parser.add_argument("--include-intra-city", action="store_true")
+    net_parser.set_defaults(func=command_network)
+    coapp = subparsers.add_parser(
+        "build-coapplication", help="build an undirected city patent co-application network"
+    )
+    add_mapping_columns(coapp)
+    coapp.add_argument("--links", type=Path, required=True)
+    coapp.add_argument("--repaco", type=Path)
+    coapp.add_argument("--output-dir", type=Path, required=True)
+    coapp.add_argument("--source-code-col")
+    coapp.add_argument("--target-code-col")
+    coapp.add_argument("--source-name-col")
+    coapp.add_argument("--target-name-col")
+    coapp.add_argument("--target-address-col")
+    coapp.add_argument("--year-col")
+    coapp.add_argument("--date-col")
+    coapp.add_argument("--patent-col")
+    coapp.add_argument("--include-intra-city", action="store_true")
+    coapp.set_defaults(func=command_coapplication)
+    return parser
 
 
 def main() -> None:
-    args = parse_args()
-    run_workflow(args.citation_file, args.company_file, args.output_dir, args.target_year)
+    args = build_parser().parse_args()
+    args.func(args)
 
 
 if __name__ == "__main__":
