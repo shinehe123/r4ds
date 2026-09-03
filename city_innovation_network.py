@@ -23,8 +23,12 @@ import networkx as nx
 import pandas as pd
 
 
-CODE_ALIASES = ("code", "股票代码", "证券代码", "stock_code")
-NAME_ALIASES = ("name", "公司名称", "公司中文名称", "企业名称")
+CODE_ALIASES = (
+    "code", "company_id", "Scode", "股票代码", "证券代码", "stock_code",
+)
+NAME_ALIASES = (
+    "name", "company_name", "中文全称", "公司名称", "公司中文名称", "企业名称",
+)
 SHORT_NAME_ALIASES = ("aliases", "证券简称", "证券名称", "简称")
 ADDRESS_ALIASES = ("address", "注册地址", "办公地址", "公司地址")
 SOURCE_CODE_ALIASES = (

@@ -36,6 +36,17 @@ def test_address_mapping_explicit_alias_county_and_municipality():
     assert result.city_code.notna().all()
 
 
+def test_cnipa_company_list_column_aliases():
+    companies = pd.DataFrame({
+        "company_id": ["1"],
+        "company_name": ["甲科技股份有限公司"],
+        "address": ["广东省深圳市南山区"],
+    })
+    result = map_companies(companies, mapper())
+    assert result.loc[0, "company_code"] == "000001"
+    assert result.loc[0, "city"] == "深圳市"
+
+
 def test_network_aggregation_and_audit():
     companies = pd.DataFrame({
         "code": ["1", "2", "3"],
